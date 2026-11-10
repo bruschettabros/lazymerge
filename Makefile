@@ -1,4 +1,4 @@
-BIN := conflux
+BIN := lazymerge
 PREFIX ?= /usr/local
 
 .PHONY: all build run test vet fmt tidy install uninstall clean

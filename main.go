@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 
 	"github.com/alecthomas/chroma/v2"
@@ -13,6 +14,7 @@ import (
 	"github.com/atotto/clipboard"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/mattn/go-runewidth"
 )
 
@@ -40,11 +42,13 @@ var (
 	cPink     = cp("#ea76cb", "#f5c2e7")
 	rainbow   = []ac{cMauve, cPink, cRed, cPeach, cYellow, cGreen, cTeal, cSky, cBlue, cLavender}
 
-	// Per pane: ours, result, theirs. Backgrounds are the pane colour
+	// Per merge pane: ours, result, theirs. Backgrounds are the pane colour
 	// blended onto the Catppuccin base.
 	paneFg   = [3]ac{cBlue, cMauve, cGreen}
 	paneBg   = [3]ac{cp("#d0dcf5", "#2e344d"), cp("#e0d5f4", "#38324c"), cp("#d5e5d7", "#364143")}
 	paneBgHi = [3]ac{cp("#b0c7f5", "#3e4b6b"), cp("#e0d5f4", "#38324c"), cp("#bbd9b8", "#495d53")}
+
+	choiceFg = map[string]ac{"pending": cYellow, "ours": cBlue, "theirs": cGreen, "both": cMauve, "base": cOverlay, "auto-merged": cTeal}
 )
 
 func fg(c lipgloss.TerminalColor) lipgloss.Style { return lipgloss.NewStyle().Foreground(c) }
@@ -53,25 +57,42 @@ func badge(text string, bg lipgloss.TerminalColor) string {
 	return lipgloss.NewStyle().Background(bg).Foreground(cCrust).Bold(true).Padding(0, 1).Render(text)
 }
 
+type panel int
+
+const (
+	pFiles panel = iota
+	pConflicts
+	pMerge
+)
+
 type fileItem struct {
 	path      string
 	conflicts int // -1 when the file cannot be parsed
 }
 
+type confirm struct {
+	title, body string
+	yes         func(m *model) tea.Cmd
+}
+
 type model struct {
-	files      []fileItem
-	cursor     int
-	file       *File
-	lexer      chroma.Lexer
-	theme      *chroma.Style
-	cur        int // current chunk
-	focus      int // Ours or Theirs
-	scroll     int
-	w, h       int
-	msg        string
-	msgErr     bool
-	dirty      bool
-	confirmEsc bool
+	files   []fileItem
+	cursor  int // selection in the Files panel
+	file    *File
+	loadErr string
+	lexer   chroma.Lexer
+	theme   *chroma.Style
+	panel   panel
+	cur     int // current chunk
+	focus   int // Ours or Theirs
+	scroll  int
+	w, h    int
+	msg     string
+	msgErr  bool
+	undo    [][]Chunk // chunk snapshots; non-empty means unsaved changes
+	help    bool
+	helpTop int // scroll position of the keybindings popup
+	confirm *confirm
 }
 
 type row struct {
@@ -83,19 +104,18 @@ type row struct {
 
 // editedMsg arrives when the external editor exits.
 type editedMsg struct {
-	path   string
-	reopen bool // go back to the merge view if conflicts remain
-	err    error
+	path string
+	err  error
 }
 
 func main() {
 	root, err := git("rev-parse", "--show-toplevel")
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "conflux: not inside a git repository")
+		fmt.Fprintln(os.Stderr, "lazymerge: not inside a git repository")
 		os.Exit(1)
 	}
 	if err := os.Chdir(strings.TrimSpace(root)); err != nil {
-		fmt.Fprintln(os.Stderr, "conflux:", err)
+		fmt.Fprintln(os.Stderr, "lazymerge:", err)
 		os.Exit(1)
 	}
 	m := model{theme: styles.Get("catppuccin-latte")}
@@ -103,10 +123,21 @@ func main() {
 		m.theme = styles.Get("catppuccin-mocha")
 	}
 	m.refresh()
-	if _, err := tea.NewProgram(m, tea.WithAltScreen()).Run(); err != nil {
-		fmt.Fprintln(os.Stderr, "conflux:", err)
+	m.preview()
+	if _, err := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion()).Run(); err != nil {
+		fmt.Fprintln(os.Stderr, "lazymerge:", err)
 		os.Exit(1)
 	}
+}
+
+// ---- state ----
+
+func (m model) dirty() bool { return len(m.undo) > 0 }
+
+func (m *model) say(msg string, isErr bool) { m.msg, m.msgErr = msg, isErr }
+
+func (m *model) ask(title, body string, yes func(m *model) tea.Cmd) {
+	m.confirm = &confirm{title, body, yes}
 }
 
 func (m *model) refresh() {
@@ -116,217 +147,153 @@ func (m *model) refresh() {
 	}
 	m.files = nil
 	for _, p := range paths {
-		n := -1
-		if data, err := os.ReadFile(p); err == nil {
-			if segs, _, err := Parse(string(data)); err == nil {
-				n = len((&File{Segs: segs}).Chunks())
-			}
+		n := -1 // same count as the Conflicts panel shows
+		if f, err := Load(p); err == nil {
+			n = len(f.Chunks())
 		}
 		m.files = append(m.files, fileItem{p, n})
 	}
 	m.cursor = min(m.cursor, max(len(m.files)-1, 0))
 }
 
-func (m *model) say(msg string, isErr bool) { m.msg, m.msgErr = msg, isErr }
+// preview shows the file under the cursor, like lazygit's main view. It never
+// replaces a file with unsaved changes.
+func (m *model) preview() {
+	if m.dirty() {
+		return
+	}
+	if len(m.files) == 0 {
+		m.file, m.loadErr = nil, ""
+		return
+	}
+	if path := m.files[m.cursor].path; m.file == nil || m.file.Path != path {
+		m.load(path)
+	}
+}
 
-func (m *model) open(f *File) {
-	m.file, m.focus, m.dirty = f, Ours, false
-	m.lexer = lexers.Match(f.Path)
+func (m *model) load(path string) {
+	m.file, m.loadErr, m.undo, m.cur, m.scroll, m.focus = nil, "", nil, 0, 0, Ours
+	f, err := Load(path)
+	if err != nil {
+		m.loadErr = path + ": " + err.Error()
+		return
+	}
+	m.file = f
+	m.lexer = lexers.Match(path)
 	if m.lexer != nil {
 		m.lexer = chroma.Coalesce(m.lexer)
 	}
 	m.jumpTo(0)
 }
 
+func (m *model) openSelected() {
+	if len(m.files) == 0 {
+		return
+	}
+	path := m.files[m.cursor].path
+	switch {
+	case m.file != nil && m.file.Path == path:
+	case m.dirty():
+		m.ask("Discard changes?", fmt.Sprintf("You have unsaved changes in %s. Discard them and open %s?", m.file.Path, path),
+			func(m *model) tea.Cmd {
+				m.load(path)
+				m.panel = pMerge
+				return nil
+			})
+		return
+	default:
+		m.load(path)
+	}
+	if m.file != nil {
+		m.panel = pMerge
+	}
+}
+
+func (m *model) snapshot() {
+	var s []Chunk
+	for _, c := range m.file.Chunks() {
+		cc := *c
+		cc.applied = slices.Clone(c.applied)
+		s = append(s, cc)
+	}
+	m.undo = append(m.undo, s)
+}
+
+func (m *model) popUndo() bool {
+	if len(m.undo) == 0 {
+		return false
+	}
+	s := m.undo[len(m.undo)-1]
+	m.undo = m.undo[:len(m.undo)-1]
+	for i, c := range m.file.Chunks() {
+		*c = s[i]
+	}
+	return true
+}
+
+func (m *model) save() {
+	if err := m.file.Save(); err != nil {
+		m.say("Save failed: "+err.Error(), true)
+		return
+	}
+	path := m.file.Path
+	m.undo, m.file = nil, nil
+	m.refresh()
+	m.preview()
+	if m.file == nil {
+		m.panel = pFiles
+	}
+	m.say("✓ "+path+" saved and staged", false)
+}
+
 // editCmd opens path in the editor git itself uses (GIT_EDITOR,
 // core.editor, VISUAL, EDITOR, then vi), run through sh the same way git does.
-func editCmd(path string, reopen bool) tea.Cmd {
+func editCmd(path string) tea.Cmd {
 	editor, err := git("var", "GIT_EDITOR")
 	if err != nil {
-		return func() tea.Msg { return editedMsg{path, reopen, err} }
+		return func() tea.Msg { return editedMsg{path, err} }
 	}
 	editor = strings.TrimSpace(editor)
 	cmd := exec.Command("sh", "-c", editor+` "$@"`, editor, path)
-	return tea.ExecProcess(cmd, func(err error) tea.Msg { return editedMsg{path, reopen, err} })
+	return tea.ExecProcess(cmd, func(err error) tea.Msg { return editedMsg{path, err} })
+}
+
+func (m *model) edit(path string) tea.Cmd {
+	// Keep the choices made so far: write them, with markers for the rest.
+	if m.file != nil && m.file.Path == path && m.dirty() {
+		if err := m.file.WriteProgress(); err != nil {
+			m.say("Could not write file: "+err.Error(), true)
+			return nil
+		}
+	}
+	return editCmd(path)
 }
 
 func (m model) afterEdit(e editedMsg) (tea.Model, tea.Cmd) {
-	m.file = nil
-	m.refresh()
 	if e.err != nil {
 		m.say("Editor failed: "+e.err.Error(), true)
 		return m, nil
 	}
-	f, err := Load(e.path)
-	switch {
-	case errors.Is(err, ErrNoConflicts):
+	if _, err := Load(e.path); errors.Is(err, ErrNoConflicts) {
 		if _, err := git("add", "--", e.path); err != nil {
 			m.say(err.Error(), true)
-			break
+		} else {
+			m.say("✓ "+e.path+" has no conflicts left, staged", false)
 		}
-		m.refresh()
-		m.say("✓ "+e.path+" has no conflicts left, staged", false)
-	case err != nil:
-		m.say(e.path+": "+err.Error(), true)
-	case e.reopen:
-		m.open(f)
+	}
+	m.refresh()
+	if m.dirty() && m.file.Path != e.path {
+		return m, nil // unsaved work in another file stays open
+	}
+	m.undo, m.file = nil, nil
+	if i := slices.IndexFunc(m.files, func(f fileItem) bool { return f.path == e.path }); i >= 0 {
+		m.cursor = i
+	}
+	m.preview()
+	if m.file == nil {
+		m.panel = pFiles
 	}
 	return m, nil
-}
-
-func (m model) Init() tea.Cmd { return nil }
-
-func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.WindowSizeMsg:
-		m.w, m.h = msg.Width, msg.Height
-	case editedMsg:
-		return m.afterEdit(msg)
-	case tea.KeyMsg:
-		if msg.String() == "ctrl+c" {
-			return m, tea.Quit
-		}
-		if m.file == nil {
-			return m.updateList(msg)
-		}
-		return m.updateMerge(msg)
-	}
-	return m, nil
-}
-
-func (m model) updateList(k tea.KeyMsg) (tea.Model, tea.Cmd) {
-	m.say("", false)
-	switch k.String() {
-	case "q", "esc":
-		return m, tea.Quit
-	case "k", "up":
-		m.cursor = max(m.cursor-1, 0)
-	case "j", "down":
-		m.cursor = min(m.cursor+1, max(len(m.files)-1, 0))
-	case "g":
-		m.cursor = 0
-	case "G":
-		m.cursor = max(len(m.files)-1, 0)
-	case "r":
-		m.refresh()
-	case "e":
-		if len(m.files) > 0 {
-			return m, editCmd(m.files[m.cursor].path, false)
-		}
-	case "enter", "l", "right":
-		if len(m.files) == 0 {
-			break
-		}
-		path := m.files[m.cursor].path
-		f, err := Load(path)
-		if err != nil {
-			m.say(path+": "+err.Error(), true)
-			break
-		}
-		m.open(f)
-	}
-	return m, nil
-}
-
-func (m model) updateMerge(k tea.KeyMsg) (tea.Model, tea.Cmd) {
-	chunks := m.file.Chunks()
-	c := chunks[m.cur]
-	key := k.String()
-	if key != "esc" && key != "q" {
-		m.confirmEsc = false
-	}
-	m.say("", false)
-	half := max(m.bodyHeight()/2, 1)
-	switch key {
-	case "esc", "q":
-		if m.dirty && !m.confirmEsc {
-			m.confirmEsc = true
-			m.say("Unsaved changes. Press esc again to discard them.", true)
-			break
-		}
-		m.file, m.confirmEsc = nil, false
-		m.refresh()
-		return m, nil
-	case "j", "down":
-		m.jumpTo(min(m.cur+1, len(chunks)-1))
-	case "k", "up":
-		m.jumpTo(max(m.cur-1, 0))
-	case "g":
-		m.jumpTo(0)
-	case "G":
-		m.jumpTo(len(chunks) - 1)
-	case "h", "left":
-		m.focus = Ours
-	case "l", "right":
-		m.focus = Theirs
-	case "ctrl+d":
-		m.scroll += half
-	case "ctrl+u":
-		m.scroll -= half
-	case "ctrl+e":
-		m.scroll++
-	case "ctrl+y":
-		m.scroll--
-	case " ":
-		c.Toggle(m.focus)
-		m.dirty = true
-	case "x":
-		c.Decline(m.focus)
-		m.dirty = true
-	case "u":
-		c.Reset()
-		m.dirty = true
-	case "n":
-		for i := 1; i <= len(chunks); i++ {
-			if j := (m.cur + i) % len(chunks); !chunks[j].Done() {
-				m.jumpTo(j)
-				break
-			}
-		}
-	case "m":
-		n := 0
-		for _, ch := range chunks {
-			if ch.AutoResolve() {
-				n++
-			}
-		}
-		m.dirty = m.dirty || n > 0
-		m.say(fmt.Sprintf("✨ Auto-resolved %d of %d conflicts", n, len(chunks)), false)
-	case "y":
-		m.copy([...]string{"ours", "", "theirs"}[m.focus*2], c.Sides[m.focus])
-	case "Y":
-		m.copy("result", c.Result())
-	case "e":
-		// Keep the choices made so far: write them, with markers for the rest.
-		if m.dirty {
-			if err := m.file.WriteProgress(); err != nil {
-				m.say("Could not write file: "+err.Error(), true)
-				break
-			}
-			m.dirty = false
-		}
-		return m, editCmd(m.file.Path, true)
-	case "s":
-		if err := m.file.Save(); err != nil {
-			m.say("Save failed: "+err.Error(), true)
-			break
-		}
-		path := m.file.Path
-		m.file = nil
-		m.refresh()
-		m.say("✓ "+path+" saved and staged", false)
-		return m, nil
-	}
-	m.scroll = max(min(m.scroll, len(m.rows())-m.bodyHeight()), 0)
-	return m, nil
-}
-
-func (m *model) copy(what string, lines []string) {
-	if err := clipboard.WriteAll(strings.Join(lines, "\n")); err != nil {
-		m.say("Copy failed: "+err.Error(), true)
-		return
-	}
-	m.say(fmt.Sprintf("📋 Copied %s (%d lines)", what, len(lines)), false)
 }
 
 // jumpTo selects chunk i and scrolls so it is in view with some context.
@@ -342,8 +309,291 @@ func (m *model) jumpTo(i int) {
 	}
 }
 
-// header 1 + pane borders 2 + pane title 1 + status 1 + help 1
-func (m model) bodyHeight() int { return max(m.h-6, 1) }
+func (m *model) clampScroll() {
+	if m.file != nil {
+		m.scroll = max(min(m.scroll, len(m.rows())-m.bodyHeight()), 0)
+	}
+}
+
+func (m *model) copy(what string, lines []string) {
+	if err := clipboard.WriteAll(strings.Join(lines, "\n")); err != nil {
+		m.say("Copy failed: "+err.Error(), true)
+		return
+	}
+	m.say(fmt.Sprintf("📋 Copied %s (%d lines)", what, len(lines)), false)
+}
+
+// ---- input ----
+
+func (m model) Init() tea.Cmd { return nil }
+
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.w, m.h = msg.Width, msg.Height
+		m.clampScroll()
+	case editedMsg:
+		return m.afterEdit(msg)
+	case tea.MouseMsg:
+		m.mouse(msg)
+	case tea.KeyMsg:
+		return m.key(msg.String())
+	}
+	return m, nil
+}
+
+func (m model) key(key string) (tea.Model, tea.Cmd) {
+	if key == "ctrl+c" {
+		return m, tea.Quit
+	}
+	if m.confirm != nil {
+		switch key {
+		case "enter", "y":
+			c := m.confirm
+			m.confirm = nil
+			return m, c.yes(&m)
+		case "esc", "n", "q":
+			m.confirm = nil
+		}
+		return m, nil
+	}
+	if m.help {
+		switch key {
+		case "esc", "q", "?", "enter":
+			m.help = false
+		case "j", "down":
+			m.helpTop++
+		case "k", "up":
+			m.helpTop = max(m.helpTop-1, 0)
+		}
+		return m, nil
+	}
+	m.say("", false)
+	switch key {
+	case "q":
+		if m.dirty() {
+			m.ask("Quit?", "You have unsaved changes in "+m.file.Path+". Quit and discard them?",
+				func(*model) tea.Cmd { return tea.Quit })
+			return m, nil
+		}
+		return m, tea.Quit
+	case "?":
+		m.help, m.helpTop = true, 0
+		return m, nil
+	case "1":
+		m.panel = pFiles
+		return m, nil
+	case "2", "3":
+		if m.file != nil {
+			m.panel = panel(key[0] - '1')
+		}
+		return m, nil
+	case "tab", "shift+tab":
+		if m.file != nil {
+			d := 1
+			if key == "shift+tab" {
+				d = 2
+			}
+			m.panel = (m.panel + panel(d)) % 3
+		}
+		return m, nil
+	case "esc":
+		m.panel = pFiles
+		return m, nil
+	case "R", "r":
+		m.refresh()
+		if !m.dirty() {
+			m.file = nil
+			m.preview()
+		}
+		m.say("Refreshed", false)
+		return m, nil
+	case "e":
+		if m.panel == pFiles && len(m.files) > 0 {
+			return m, m.edit(m.files[m.cursor].path)
+		}
+		if m.file != nil {
+			return m, m.edit(m.file.Path)
+		}
+		return m, nil
+	}
+	if m.panel == pFiles {
+		m.keyFiles(key)
+	} else if m.file != nil {
+		m.keyMerge(key)
+	}
+	return m, nil
+}
+
+func (m *model) keyFiles(key string) {
+	n := len(m.files)
+	switch key {
+	case "j", "down":
+		m.cursor = min(m.cursor+1, max(n-1, 0))
+	case "k", "up":
+		m.cursor = max(m.cursor-1, 0)
+	case "g", "home":
+		m.cursor = 0
+	case "G", "end":
+		m.cursor = max(n-1, 0)
+	case "enter", "l", "right", " ":
+		m.openSelected()
+		return
+	default:
+		return
+	}
+	m.preview()
+}
+
+func (m *model) keyMerge(key string) {
+	chunks := m.file.Chunks()
+	c := chunks[m.cur]
+	half := max(m.bodyHeight()/2, 1)
+	switch key {
+	case "j", "down":
+		m.jumpTo(min(m.cur+1, len(chunks)-1))
+	case "k", "up":
+		m.jumpTo(max(m.cur-1, 0))
+	case "g", "home":
+		m.jumpTo(0)
+	case "G", "end":
+		m.jumpTo(len(chunks) - 1)
+	case "h", "left":
+		m.focus = Ours
+	case "l", "right":
+		m.focus = Theirs
+	case "enter":
+		m.panel = pMerge
+	case "ctrl+d":
+		m.scroll += half
+	case "ctrl+u":
+		m.scroll -= half
+	case "ctrl+e":
+		m.scroll++
+	case "ctrl+y":
+		m.scroll--
+	case " ":
+		m.snapshot()
+		c.Toggle(m.focus)
+	case "b":
+		m.snapshot()
+		c.Reset()
+		c.Accept(Ours)
+		c.Accept(Theirs)
+	case "x":
+		m.snapshot()
+		c.Decline(m.focus)
+	case "z":
+		if m.popUndo() {
+			m.say("↶ Undone", false)
+		} else {
+			m.say("Nothing to undo", true)
+		}
+	case "n":
+		for i := 1; i <= len(chunks); i++ {
+			if j := (m.cur + i) % len(chunks); !chunks[j].Done() {
+				m.jumpTo(j)
+				break
+			}
+		}
+	case "m":
+		m.snapshot()
+		n := 0
+		for _, ch := range chunks {
+			if ch.AutoResolve() {
+				n++
+			}
+		}
+		if n == 0 {
+			m.undo = m.undo[:len(m.undo)-1]
+		}
+		m.say(fmt.Sprintf("✨ Auto-resolved %d of %d conflicts", n, len(chunks)), false)
+	case "y":
+		m.copy([...]string{"ours", "", "theirs"}[m.focus*2], c.Sides[m.focus])
+	case "Y":
+		m.copy("result", c.Result())
+	case "s":
+		m.save()
+		return
+	}
+	m.clampScroll()
+}
+
+func (m *model) mouse(e tea.MouseMsg) {
+	if m.confirm != nil || m.help {
+		return
+	}
+	sideW, filesH := m.layout()
+	inSide := e.X < sideW
+	switch e.Button {
+	case tea.MouseButtonWheelUp, tea.MouseButtonWheelDown:
+		d := 1
+		if e.Button == tea.MouseButtonWheelUp {
+			d = -1
+		}
+		switch {
+		case inSide && e.Y < filesH:
+			m.cursor = max(min(m.cursor+d, len(m.files)-1), 0)
+			m.preview()
+		case inSide && m.file != nil:
+			m.jumpTo(max(min(m.cur+d, len(m.file.Chunks())-1), 0))
+		case m.file != nil:
+			m.scroll += 3 * d
+			m.clampScroll()
+		}
+		return
+	case tea.MouseButtonLeft:
+		if e.Action != tea.MouseActionPress {
+			return
+		}
+	default:
+		return
+	}
+	switch {
+	case inSide && e.Y < filesH:
+		m.panel = pFiles
+		if i := listOffset(m.cursor, len(m.files), filesH-2) + e.Y - 1; e.Y > 0 && i >= 0 && i < len(m.files) {
+			m.cursor = i
+			m.preview()
+		}
+	case inSide && m.file != nil:
+		m.panel = pConflicts
+		n, ih := len(m.file.Chunks()), m.h-1-filesH-2
+		if i := listOffset(m.cur, n, ih) + e.Y - filesH - 1; e.Y > filesH && i >= 0 && i < n {
+			m.jumpTo(i)
+		}
+	case m.file != nil:
+		m.panel = pMerge
+		if (e.X-sideW)/max((m.w-sideW)/3, 1) == 0 {
+			m.focus = Ours
+		} else if (e.X-sideW)/max((m.w-sideW)/3, 1) >= 2 {
+			m.focus = Theirs
+		}
+		if rows, r := m.rows(), m.scroll+e.Y-1; e.Y > 0 && r < len(rows) && rows[r].chunk >= 0 {
+			m.cur = rows[r].chunk
+		}
+	}
+}
+
+// ---- layout ----
+
+// layout gives the sidebar width and the Files panel height (with borders).
+func (m model) layout() (sideW, filesH int) {
+	sideW = min(max(m.w/4, 26), 40)
+	if m.w < 100 {
+		sideW = max(m.w/3, 16)
+	}
+	filesH = min(max(len(m.files)+2, 3), max((m.h-1)/2, 3))
+	return sideW, filesH
+}
+
+// Merge pane rows: everything but the bottom bar and the pane borders.
+func (m model) bodyHeight() int { return max(m.h-3, 1) }
+
+// listOffset is the first visible item of a list so that sel is in view.
+func listOffset(sel, n, visible int) int {
+	return max(min(sel-visible+1, n-visible), 0)
+}
 
 func (m model) rows() []row {
 	var rows []row
@@ -370,6 +620,67 @@ func (m model) rows() []row {
 		ci++
 	}
 	return rows
+}
+
+// chunkLines gives the line in the resolved file where each chunk starts.
+func (m model) chunkLines() []int {
+	var out []int
+	line := 1
+	for _, s := range m.file.Segs {
+		if s.Chunk == nil {
+			line += len(s.Lines)
+			continue
+		}
+		out = append(out, line)
+		line += len(s.Chunk.Result())
+	}
+	return out
+}
+
+// ---- rendering ----
+
+// box draws a rounded panel of w x h with the title in the top border and
+// the footer in the bottom border, lazygit style.
+func box(title, footer string, lines []string, w, h int, border lipgloss.TerminalColor, ts lipgloss.Style) string {
+	iw, ih := max(w-2, 0), max(h-2, 0)
+	bs := fg(border)
+	title = runewidth.Truncate(title, max(iw-3, 0), "…")
+	footer = runewidth.Truncate(footer, max(iw-3, 0), "")
+	tw, fw := runewidth.StringWidth(title), runewidth.StringWidth(footer)
+	var b strings.Builder
+	b.WriteString(bs.Render("╭─") + ts.Render(title) + bs.Render(strings.Repeat("─", max(iw-1-tw, 0))+"╮") + "\n")
+	for i := range ih {
+		l := ""
+		if i < len(lines) {
+			l = ansi.Truncate(lines[i], iw, "")
+		}
+		b.WriteString(bs.Render("│") + l + "\x1b[0m" + strings.Repeat(" ", max(iw-ansi.StringWidth(l), 0)) + bs.Render("│") + "\n")
+	}
+	b.WriteString(bs.Render("╰"+strings.Repeat("─", max(iw-1-fw, 0))) + fg(cSub).Render(footer) + bs.Render("─╯"))
+	return b.String()
+}
+
+// overlay draws top in the centre of base.
+func overlay(base, top string, w, h int) string {
+	bl, tl := strings.Split(base, "\n"), strings.Split(top, "\n")
+	tw := lipgloss.Width(top)
+	x, y := max((w-tw)/2, 0), max((h-len(tl))/2, 0)
+	for i, l := range tl {
+		if y+i >= len(bl) {
+			break
+		}
+		left := ansi.Truncate(bl[y+i], x, "")
+		left += strings.Repeat(" ", max(x-ansi.StringWidth(left), 0))
+		bl[y+i] = left + "\x1b[0m" + l + "\x1b[0m" + ansi.TruncateLeft(bl[y+i], x+tw, "")
+	}
+	return strings.Join(bl, "\n")
+}
+
+func (m model) panelStyle(p panel) (lipgloss.TerminalColor, lipgloss.Style) {
+	if m.panel == p {
+		return cGreen, fg(cGreen).Bold(true)
+	}
+	return cSurface1, fg(cSub)
 }
 
 // paint renders one line at exactly width w on top of base, with syntax
@@ -401,152 +712,146 @@ func (m model) View() string {
 	if m.w == 0 {
 		return ""
 	}
-	if m.file == nil {
-		return m.viewList()
+	sideW, filesH := m.layout()
+	full := m.h - 1
+	side := m.filesBox(sideW, filesH) + "\n" + m.conflictsBox(sideW, full-filesH)
+	view := lipgloss.JoinHorizontal(lipgloss.Top, side, m.mainView(m.w-sideW, full)) + "\n" + m.bottomBar()
+	if m.help {
+		view = overlay(view, m.helpBox(), m.w, m.h)
 	}
-	return m.viewMerge()
+	if m.confirm != nil {
+		view = overlay(view, m.confirmBox(), m.w, m.h)
+	}
+	return view
 }
 
-// helpBar takes key, description pairs. Each key gets the next rainbow colour.
-func (m model) helpBar(keys ...string) string {
-	var parts []string
-	for i := 0; i+1 < len(keys); i += 2 {
-		parts = append(parts, fg(rainbow[i/2%len(rainbow)]).Bold(true).Render(keys[i])+" "+fg(cSub).Render(keys[i+1]))
-	}
-	return lipgloss.NewStyle().MaxWidth(m.w).Render(" " + strings.Join(parts, fg(cSurface1).Render(" • ")))
-}
-
-func (m model) toast() string {
-	if m.msg == "" {
-		return ""
-	}
-	if m.msgErr {
-		return fg(cRed).Bold(true).Render("✗ " + m.msg)
-	}
-	return fg(cGreen).Render(m.msg)
-}
-
-func (m model) viewList() string {
-	var b strings.Builder
-	b.WriteString(" " + badge("◆ conflux", cMauve) + fg(cLavender).Render("  merge conflict resolver") + "\n\n")
-	boxW := max(min(m.w-2, 80), 24)
-	inner := boxW - 4
+func (m model) filesBox(w, h int) string {
+	iw, ih := w-2, h-2
 	var lines []string
 	if len(m.files) == 0 {
-		lines = append(lines, fg(cGreen).Bold(true).Render("✓ No conflicted files. All clear! 🎉"))
+		lines = append(lines, fg(cGreen).Render(" ✓ all clear"))
 	}
-	for i, f := range m.files {
-		count := fmt.Sprintf("%d conflict", f.conflicts)
-		if f.conflicts != 1 {
-			count += "s"
-		}
+	for i := listOffset(m.cursor, len(m.files), ih); i < len(m.files) && len(lines) < ih; i++ {
+		f := m.files[i]
+		count := fmt.Sprint(f.conflicts)
 		if f.conflicts < 0 {
-			count = "cannot parse"
+			count = "!"
 		}
-		name := runewidth.Truncate(f.path, inner-len(count)-5, "…")
-		gap := strings.Repeat(" ", max(inner-3-runewidth.StringWidth(name)-len(count), 1))
+		icon, iconFg := "  ", lipgloss.TerminalColor(cPeach)
+		if m.file != nil && m.file.Path == f.path {
+			icon = "▶ "
+			if m.dirty() {
+				icon = "● "
+			}
+		}
+		name := runewidth.Truncate(f.path, max(iw-4-len(count), 1), "…")
+		gap := strings.Repeat(" ", max(iw-3-runewidth.StringWidth(name)-len(count), 1))
+		st := lipgloss.NewStyle()
 		if i == m.cursor {
-			bg := lipgloss.NewStyle().Background(cSurface0)
-			lines = append(lines, bg.Foreground(cPeach).Render("▌ ")+bg.Foreground(cText).Bold(true).Render(name)+
-				bg.Render(gap)+bg.Foreground(cPeach).Render(count)+bg.Render(" "))
-		} else {
-			lines = append(lines, "  "+fg(cText).Render(name)+gap+fg(cOverlay).Render(count)+" ")
+			st = st.Background(cSurface0)
+			if m.panel == pFiles {
+				st = st.Background(cSurface1).Bold(true)
+			}
 		}
+		lines = append(lines, st.Foreground(iconFg).Render(icon)+st.Foreground(cText).Render(name+gap)+
+			st.Foreground(cYellow).Render(count)+st.Render(" "))
 	}
-	box := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(cMauve).
-		Padding(0, 1).Width(boxW - 2).Render(strings.Join(lines, "\n"))
-	b.WriteString(box + "\n " + m.toast() + "\n")
-	b.WriteString(m.helpBar("j/k", "move", "enter", "open", "e", "edit", "r", "refresh", "q", "quit"))
-	return b.String()
+	footer := ""
+	if len(m.files) > 0 {
+		footer = fmt.Sprintf("%d of %d", m.cursor+1, len(m.files))
+	}
+	border, ts := m.panelStyle(pFiles)
+	return box("[1] Files", footer, lines, w, h, border, ts)
 }
 
-func (m model) viewMerge() string {
+func (m model) conflictsBox(w, h int) string {
+	iw, ih := w-2, h-2
+	var lines []string
+	footer := ""
+	if m.file != nil {
+		chunks := m.file.Chunks()
+		starts := m.chunkLines()
+		for i := listOffset(m.cur, len(chunks), ih); i < len(chunks) && len(lines) < ih; i++ {
+			c := chunks[i]
+			choice := c.Choice()
+			icon := "✓ "
+			switch choice {
+			case "pending":
+				icon = "● "
+			case "auto-merged":
+				icon = "✦ "
+			}
+			left := fmt.Sprintf("#%-3d", i+1)
+			at := fmt.Sprintf("L%d", starts[i])
+			gap := strings.Repeat(" ", max(iw-2-len(left)-len(at)-len(choice)-2, 1))
+			st := lipgloss.NewStyle()
+			if i == m.cur {
+				st = st.Background(cSurface0)
+				if m.panel == pConflicts {
+					st = st.Background(cSurface1).Bold(true)
+				}
+			}
+			lines = append(lines, st.Foreground(choiceFg[choice]).Render(icon)+st.Foreground(cText).Render(left)+
+				st.Foreground(cOverlay).Render(at+gap)+st.Foreground(choiceFg[choice]).Render(choice)+st.Render(" "))
+		}
+		footer = fmt.Sprintf("%d of %d", m.cur+1, len(chunks))
+	}
+	border, ts := m.panelStyle(pConflicts)
+	return box("[2] Conflicts", footer, lines, w, h, border, ts)
+}
+
+func (m model) mainView(w, h int) string {
+	if m.file == nil {
+		var content string
+		switch {
+		case m.loadErr != "":
+			content = fg(cRed).Render("✗ " + m.loadErr)
+		case len(m.files) == 0:
+			content = fg(cGreen).Bold(true).Render("✓ No conflicted files. All clear! 🎉")
+		default:
+			content = fg(cSub).Render("Select a file in [1] Files")
+		}
+		content = badge("◆ lazymerge", cMauve) + "\n" + fg(cSub).Render("merge conflicts, the lazy way") + "\n\n" +
+			lipgloss.NewStyle().Width(max(w-6, 1)).Align(lipgloss.Center).Render(content)
+		body := lipgloss.Place(w-2, h-2, lipgloss.Center, lipgloss.Center, content, lipgloss.WithWhitespaceChars(" "))
+		border, ts := m.panelStyle(pMerge)
+		return box("[3] Merge", "", strings.Split(body, "\n"), w, h, border, ts)
+	}
+
 	chunks := m.file.Chunks()
-	open := 0
+	done := 0
 	for _, c := range chunks {
-		if !c.Done() {
-			open++
+		if c.Done() {
+			done++
 		}
 	}
-
-	// Header: badge, path, rainbow progress bar.
-	left := " " + badge("◆ conflux", cMauve) + " " + fg(cLavender).Bold(true).Render(m.file.Path)
-	if m.dirty {
-		left += fg(cPeach).Render(" ● unsaved")
-	}
-	done := len(chunks) - open
-	barW := 20
-	filled := done * barW / len(chunks)
-	var bar strings.Builder
-	for i := range barW {
-		if i < filled {
-			bar.WriteString(fg(rainbow[i*len(rainbow)/barW]).Render("━"))
-		} else {
-			bar.WriteString(fg(cSurface1).Render("━"))
-		}
-	}
-	progress := fg(cSub).Render(fmt.Sprintf(" %d/%d resolved ", done, len(chunks)))
-	if open == 0 {
-		progress = fg(cGreen).Bold(true).Render(" ✓ all resolved, press s ")
-	}
-	right := bar.String() + progress
-	header := left + strings.Repeat(" ", max(m.w-lipgloss.Width(left)-lipgloss.Width(right), 1)) + right
-
-	// Panes.
 	rows := m.rows()
-	bodyH := m.bodyHeight()
+	bodyH := h - 2
 	start := min(m.scroll, max(len(rows)-1, 0))
 	end := min(start+bodyH, len(rows))
-	widths := [3]int{m.w / 3, m.w - 2*(m.w/3), m.w / 3}
-	titles := [3]string{"◀ OURS · " + m.file.Labels[Ours], "✦ RESULT ✦", "THEIRS · " + m.file.Labels[Theirs] + " ▶"}
+	widths := [3]int{w / 3, w - 2*(w/3), w / 3}
+	titles := [3]string{"[3] Ours · " + m.file.Labels[Ours], "Result", "Theirs · " + m.file.Labels[Theirs]}
+	footers := [3]string{"", fmt.Sprintf("%d/%d resolved", done, len(chunks)), ""}
+	if done == len(chunks) {
+		footers[1] = "✓ all resolved, s to save"
+	}
 	var panes [3]string
 	for p := range 3 {
 		inner := max(widths[p]-2, 4)
-		focused := p == m.focus*2
-		title := runewidth.Truncate(titles[p], inner-2, "…")
-		ts := fg(paneFg[p]).Bold(true).Render(" " + title + " ")
-		if focused {
-			ts = badge(title, paneFg[p])
-		}
-		lines := []string{lipgloss.PlaceHorizontal(inner, lipgloss.Center, ts)}
+		var lines []string
 		for _, r := range rows[start:end] {
 			lines = append(lines, m.cell(r, p, inner, chunks))
 		}
-		for len(lines) < bodyH+1 {
-			lines = append(lines, strings.Repeat(" ", inner))
+		border, ts := lipgloss.TerminalColor(cSurface1), fg(paneFg[p])
+		if p == m.focus*2 {
+			border, ts = cOverlay, ts.Bold(true)
+			if m.panel == pMerge {
+				border = paneFg[p]
+			}
 		}
-		border := lipgloss.TerminalColor(cSurface1)
-		if focused {
-			border = paneFg[p]
-		}
-		panes[p] = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(border).Render(strings.Join(lines, "\n"))
+		panes[p] = box(titles[p], footers[p], lines, widths[p], h, border, ts)
 	}
-
-	// Status line for the current conflict.
-	c := chunks[m.cur]
-	status := " " + badge(fmt.Sprintf("Conflict %d/%d", m.cur+1, len(chunks)), cPeach) + "  "
-	if c.AutoMerged() {
-		status += fg(cTeal).Render("✨ auto-merged line by line")
-	} else {
-		for side, name := range []string{"ours", "theirs"} {
-			status += fg(paneFg[side*2]).Bold(true).Render(name) + " " + stateBadge(c.States[side]) + "   "
-		}
-	}
-	status = strings.TrimRight(status, " ") + "   " + m.toast()
-
-	return header + "\n" + lipgloss.JoinHorizontal(lipgloss.Top, panes[:]...) + "\n" + status + "\n" +
-		m.helpBar("j/k", "change", "h/l", "side", "space", "accept", "x", "decline", "u", "reset",
-			"n", "next open", "m", "auto", "e", "edit", "y/Y", "copy", "s", "save", "esc", "back")
-}
-
-func stateBadge(s State) string {
-	switch s {
-	case Applied:
-		return fg(cGreen).Render("✓ accepted")
-	case Ignored:
-		return fg(cRed).Render("✗ declined")
-	}
-	return fg(cYellow).Render("● pending")
+	return lipgloss.JoinHorizontal(lipgloss.Top, panes[:]...)
 }
 
 // cell renders pane p of one row: a 2-wide gutter and the text.
@@ -597,4 +902,83 @@ func (m model) cell(r row, p, inner int, chunks []*Chunk) string {
 		base = base.Foreground(cOverlay).Italic(true)
 	}
 	return fg(gutterFg).Render(gutter+" ") + m.paint(text, w, base, highlight)
+}
+
+// keyHints takes key, description pairs. Each key gets the next rainbow colour.
+func keyHints(keys ...string) string {
+	var parts []string
+	for i := 0; i+1 < len(keys); i += 2 {
+		parts = append(parts, fg(rainbow[i/2%len(rainbow)]).Bold(true).Render(keys[i])+" "+fg(cSub).Render(keys[i+1]))
+	}
+	return " " + strings.Join(parts, fg(cSurface1).Render(" │ "))
+}
+
+func (m model) bottomBar() string {
+	var left string
+	switch {
+	case m.msg != "" && m.msgErr:
+		left = " " + fg(cRed).Bold(true).Render("✗ "+m.msg)
+	case m.msg != "":
+		left = " " + fg(cGreen).Render(m.msg)
+	case m.panel == pFiles:
+		left = keyHints("enter", "open", "e", "edit", "R", "refresh", "?", "keybindings", "q", "quit")
+	default:
+		left = keyHints("space", "pick", "b", "both", "x", "decline", "z", "undo", "m", "auto", "e", "edit", "s", "save", "?", "keybindings")
+	}
+	right := fg(cMauve).Bold(true).Render("lazymerge ")
+	if m.dirty() {
+		right = fg(cPeach).Render("● unsaved  ") + right
+	}
+	room := m.w - lipgloss.Width(right) - 1
+	if lipgloss.Width(left) > room {
+		left = ansi.Truncate(left, max(room, 0), "…")
+	}
+	return left + strings.Repeat(" ", max(m.w-lipgloss.Width(left)-lipgloss.Width(right), 0)) + right
+}
+
+var keyHelp = []struct {
+	section string
+	keys    [][2]string
+}{
+	{"Global", [][2]string{
+		{"1 2 3", "go to panel"}, {"tab / shift+tab", "next / previous panel"}, {"e", "edit file in your editor"},
+		{"R", "refresh files"}, {"esc", "back to files"}, {"?", "keybindings"}, {"q", "quit"}}},
+	{"Files", [][2]string{{"j k", "move (shows the file)"}, {"enter / l", "open file"}}},
+	{"Conflicts and merge", [][2]string{
+		{"j k", "next / previous conflict"}, {"h l", "select ours / theirs"},
+		{"space", "pick selected change (again to unpick)"}, {"b", "pick both"}, {"x", "decline selected change"},
+		{"z", "undo"}, {"n", "next open conflict"}, {"m", "auto-resolve simple conflicts"},
+		{"y / Y", "copy change / result"}, {"ctrl+d ctrl+u", "scroll"}, {"s", "save and stage"}}},
+	{"Mouse", [][2]string{{"click", "select panel, file, conflict, side"}, {"wheel", "move / scroll"}}},
+}
+
+func (m model) helpBox() string {
+	var lines []string
+	for _, s := range keyHelp {
+		if len(lines) > 0 {
+			lines = append(lines, "")
+		}
+		lines = append(lines, " "+fg(cPeach).Bold(true).Render(s.section))
+		for _, k := range s.keys {
+			lines = append(lines, "   "+fg(cMauve).Render(fmt.Sprintf("%-16s", k[0]))+fg(cText).Render(k[1]))
+		}
+	}
+	h := min(len(lines)+2, m.h-2)
+	footer := "esc to close"
+	if len(lines) > h-2 {
+		footer = "j/k scroll · esc to close"
+		lines = lines[min(m.helpTop, len(lines)-(h-2)):]
+	}
+	return box("Keybindings", footer, lines, min(m.w-4, 62), h, cMauve, fg(cMauve).Bold(true))
+}
+
+func (m model) confirmBox() string {
+	w := min(m.w-4, 56)
+	body := lipgloss.NewStyle().Width(w - 4).Render(m.confirm.body)
+	var lines []string
+	for _, l := range strings.Split(body, "\n") {
+		lines = append(lines, " "+fg(cText).Render(l))
+	}
+	lines = append(lines, "", " "+keyHints("enter", "confirm", "esc", "cancel"))
+	return box(m.confirm.title, "", lines, w, len(lines)+2, cPeach, fg(cPeach).Bold(true))
 }

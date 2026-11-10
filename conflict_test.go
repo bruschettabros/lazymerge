@@ -46,20 +46,21 @@ func TestParseAndAcceptOrder(t *testing.T) {
 func TestToggle(t *testing.T) {
 	c := &Chunk{Base: []string{"b"}, Sides: [2][]string{{"o"}, {"t"}}}
 	steps := []struct {
-		do   func()
-		want []string
-		done bool
+		do     func()
+		want   []string
+		done   bool
+		choice string
 	}{
-		{func() { c.Toggle(Ours) }, []string{"o"}, true},        // accept ours, decline theirs
-		{func() { c.Toggle(Theirs) }, []string{"o", "t"}, true}, // add theirs: both
-		{func() { c.Toggle(Ours) }, []string{"t"}, true},        // un-accept ours
-		{func() { c.Decline(Theirs) }, []string{"b"}, true},     // decline both: base
-		{func() { c.Reset() }, []string{"b"}, false},
+		{func() { c.Toggle(Ours) }, []string{"o"}, true, "ours"},        // accept ours, decline theirs
+		{func() { c.Toggle(Theirs) }, []string{"o", "t"}, true, "both"}, // add theirs: both
+		{func() { c.Toggle(Ours) }, []string{"t"}, true, "theirs"},      // un-accept ours
+		{func() { c.Decline(Theirs) }, []string{"b"}, true, "base"},     // decline both: base
+		{func() { c.Reset() }, []string{"b"}, false, "pending"},
 	}
 	for i, st := range steps {
 		st.do()
-		if !reflect.DeepEqual(c.Result(), st.want) || c.Done() != st.done {
-			t.Fatalf("step %d: result %q done %v", i, c.Result(), c.Done())
+		if !reflect.DeepEqual(c.Result(), st.want) || c.Done() != st.done || c.Choice() != st.choice {
+			t.Fatalf("step %d: result %q done %v choice %s", i, c.Result(), c.Done(), c.Choice())
 		}
 	}
 }

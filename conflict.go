@@ -91,6 +91,23 @@ func (c *Chunk) Done() bool { return c.States[Ours] != Pending && c.States[Their
 
 func (c *Chunk) AutoMerged() bool { return c.merged != nil }
 
+// Choice names what the chunk resolves to, for the conflicts list.
+func (c *Chunk) Choice() string {
+	switch {
+	case c.merged != nil:
+		return "auto-merged"
+	case !c.Done():
+		return "pending"
+	case len(c.applied) == 2:
+		return "both"
+	case len(c.applied) == 0:
+		return "base"
+	case c.applied[0] == Ours:
+		return "ours"
+	}
+	return "theirs"
+}
+
 // Result is what goes into the file for this chunk. Like JetBrains, the base
 // text stays until a side is accepted.
 func (c *Chunk) Result() []string {
@@ -334,7 +351,7 @@ func addBaseFromStages(f *File) {
 	if chunks[0].HasBase {
 		return
 	}
-	dir, err := os.MkdirTemp("", "conflux")
+	dir, err := os.MkdirTemp("", "lazymerge")
 	if err != nil {
 		return
 	}
