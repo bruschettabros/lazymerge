@@ -248,12 +248,29 @@ func (f *File) Chunks() []*Chunk {
 	return out
 }
 
-func (f *File) Text() string {
+// Text is the resolved file content.
+func (f *File) Text() string { return f.render(false) }
+
+// render builds the file text. With markers set, open conflicts are written
+// back as git conflict markers (with the base, when known).
+func (f *File) render(markers bool) string {
 	var lines []string
 	for _, s := range f.Segs {
-		if s.Chunk != nil {
-			lines = append(lines, s.Chunk.Result()...)
-		} else {
+		c := s.Chunk
+		switch {
+		case c != nil && markers && !c.Done():
+			lines = append(lines, strings.TrimSpace("<<<<<<< "+f.Labels[Ours]))
+			lines = append(lines, c.Sides[Ours]...)
+			if c.HasBase {
+				lines = append(lines, "||||||| base")
+				lines = append(lines, c.Base...)
+			}
+			lines = append(lines, "=======")
+			lines = append(lines, c.Sides[Theirs]...)
+			lines = append(lines, strings.TrimSpace(">>>>>>> "+f.Labels[Theirs]))
+		case c != nil:
+			lines = append(lines, c.Result()...)
+		default:
 			lines = append(lines, s.Lines...)
 		}
 	}
@@ -263,6 +280,8 @@ func (f *File) Text() string {
 	}
 	return out
 }
+
+var ErrNoConflicts = errors.New("no conflict blocks in file (binary, deleted, or already resolved?)")
 
 func git(args ...string) (string, error) {
 	var stderr bytes.Buffer
@@ -295,7 +314,7 @@ func Load(path string) (*File, error) {
 	}
 	f := &File{Path: path, Segs: segs, TrailingNewline: nl}
 	if len(f.Chunks()) == 0 {
-		return nil, errors.New("no conflict blocks in file (binary, deleted, or already resolved?)")
+		return nil, ErrNoConflicts
 	}
 	f.Labels = f.Chunks()[0].Labels
 	if f.Labels[Ours] == "HEAD" {
@@ -376,4 +395,14 @@ func (f *File) Save() error {
 	}
 	_, err = git("add", "--", f.Path)
 	return err
+}
+
+// WriteProgress writes resolved conflicts and keeps open ones as markers,
+// so the file can be finished in an editor. It does not stage the file.
+func (f *File) WriteProgress() error {
+	info, err := os.Stat(f.Path)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(f.Path, []byte(f.render(true)), info.Mode().Perm())
 }

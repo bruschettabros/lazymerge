@@ -1,8 +1,10 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 
 	"github.com/alecthomas/chroma/v2"
@@ -16,23 +18,40 @@ import (
 
 type ac = lipgloss.AdaptiveColor
 
-var (
-	accent   = ac{Light: "#D75F00", Dark: "#FFAF5F"}
-	faint    = ac{Light: "#9E9E9E", Dark: "#6C6C6C"}
-	textFg   = ac{Light: "#303030", Dark: "#D0D0D0"}
-	doneFg   = ac{Light: "#558B2F", Dark: "#8FBF7F"}
-	errFg    = ac{Light: "#C62828", Dark: "#E06C75"}
-	resultFg = ac{Light: "#7B1FA2", Dark: "#C678DD"}
-	resultBg = ac{Light: "#F6EDF8", Dark: "#2A2033"}
-	// Per pane: ours, result, theirs.
-	paneFg   = [3]ac{{Light: "#005FAF", Dark: "#61AFEF"}, resultFg, {Light: "#2E7D32", Dark: "#98C379"}}
-	paneBg   = [3]ac{{Light: "#E8F1FC", Dark: "#1B2B3C"}, resultBg, {Light: "#EAF6EA", Dark: "#1C3022"}}
-	paneBgHi = [3]ac{{Light: "#C6DCF7", Dark: "#2A4D70"}, resultBg, {Light: "#C8E6C9", Dark: "#2E5236"}}
+// cp is a Catppuccin colour: Latte on light terminals, Mocha on dark ones.
+func cp(latte, mocha string) ac { return ac{Light: latte, Dark: mocha} }
 
-	faintStyle = lipgloss.NewStyle().Foreground(faint)
-	keyStyle   = lipgloss.NewStyle().Foreground(accent).Bold(true)
-	badgeStyle = lipgloss.NewStyle().Background(accent).Foreground(lipgloss.Color("#1C1C1C")).Bold(true).Padding(0, 1)
+var (
+	cText     = cp("#4c4f69", "#cdd6f4")
+	cSub      = cp("#6c6f85", "#a6adc8")
+	cOverlay  = cp("#9ca0b0", "#6c7086")
+	cSurface0 = cp("#ccd0da", "#313244")
+	cSurface1 = cp("#bcc0cc", "#45475a")
+	cCrust    = cp("#dce0e8", "#11111b")
+	cRed      = cp("#d20f39", "#f38ba8")
+	cPeach    = cp("#fe640b", "#fab387")
+	cYellow   = cp("#df8e1d", "#f9e2af")
+	cGreen    = cp("#40a02b", "#a6e3a1")
+	cTeal     = cp("#179299", "#94e2d5")
+	cSky      = cp("#04a5e5", "#89dceb")
+	cBlue     = cp("#1e66f5", "#89b4fa")
+	cLavender = cp("#7287fd", "#b4befe")
+	cMauve    = cp("#8839ef", "#cba6f7")
+	cPink     = cp("#ea76cb", "#f5c2e7")
+	rainbow   = []ac{cMauve, cPink, cRed, cPeach, cYellow, cGreen, cTeal, cSky, cBlue, cLavender}
+
+	// Per pane: ours, result, theirs. Backgrounds are the pane colour
+	// blended onto the Catppuccin base.
+	paneFg   = [3]ac{cBlue, cMauve, cGreen}
+	paneBg   = [3]ac{cp("#d0dcf5", "#2e344d"), cp("#e0d5f4", "#38324c"), cp("#d5e5d7", "#364143")}
+	paneBgHi = [3]ac{cp("#b0c7f5", "#3e4b6b"), cp("#e0d5f4", "#38324c"), cp("#bbd9b8", "#495d53")}
 )
+
+func fg(c lipgloss.TerminalColor) lipgloss.Style { return lipgloss.NewStyle().Foreground(c) }
+
+func badge(text string, bg lipgloss.TerminalColor) string {
+	return lipgloss.NewStyle().Background(bg).Foreground(cCrust).Bold(true).Padding(0, 1).Render(text)
+}
 
 type fileItem struct {
 	path      string
@@ -62,6 +81,13 @@ type row struct {
 	empty [3]bool // that pane has no lines for this chunk
 }
 
+// editedMsg arrives when the external editor exits.
+type editedMsg struct {
+	path   string
+	reopen bool // go back to the merge view if conflicts remain
+	err    error
+}
+
 func main() {
 	root, err := git("rev-parse", "--show-toplevel")
 	if err != nil {
@@ -72,9 +98,9 @@ func main() {
 		fmt.Fprintln(os.Stderr, "conflux:", err)
 		os.Exit(1)
 	}
-	m := model{theme: styles.Get("github")}
+	m := model{theme: styles.Get("catppuccin-latte")}
 	if lipgloss.HasDarkBackground() {
-		m.theme = styles.Get("monokai")
+		m.theme = styles.Get("catppuccin-mocha")
 	}
 	m.refresh()
 	if _, err := tea.NewProgram(m, tea.WithAltScreen()).Run(); err != nil {
@@ -103,12 +129,59 @@ func (m *model) refresh() {
 
 func (m *model) say(msg string, isErr bool) { m.msg, m.msgErr = msg, isErr }
 
+func (m *model) open(f *File) {
+	m.file, m.focus, m.dirty = f, Ours, false
+	m.lexer = lexers.Match(f.Path)
+	if m.lexer != nil {
+		m.lexer = chroma.Coalesce(m.lexer)
+	}
+	m.jumpTo(0)
+}
+
+// editCmd opens path in the editor git itself uses (GIT_EDITOR,
+// core.editor, VISUAL, EDITOR, then vi), run through sh the same way git does.
+func editCmd(path string, reopen bool) tea.Cmd {
+	editor, err := git("var", "GIT_EDITOR")
+	if err != nil {
+		return func() tea.Msg { return editedMsg{path, reopen, err} }
+	}
+	editor = strings.TrimSpace(editor)
+	cmd := exec.Command("sh", "-c", editor+` "$@"`, editor, path)
+	return tea.ExecProcess(cmd, func(err error) tea.Msg { return editedMsg{path, reopen, err} })
+}
+
+func (m model) afterEdit(e editedMsg) (tea.Model, tea.Cmd) {
+	m.file = nil
+	m.refresh()
+	if e.err != nil {
+		m.say("Editor failed: "+e.err.Error(), true)
+		return m, nil
+	}
+	f, err := Load(e.path)
+	switch {
+	case errors.Is(err, ErrNoConflicts):
+		if _, err := git("add", "--", e.path); err != nil {
+			m.say(err.Error(), true)
+			break
+		}
+		m.refresh()
+		m.say("✓ "+e.path+" has no conflicts left, staged", false)
+	case err != nil:
+		m.say(e.path+": "+err.Error(), true)
+	case e.reopen:
+		m.open(f)
+	}
+	return m, nil
+}
+
 func (m model) Init() tea.Cmd { return nil }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.w, m.h = msg.Width, msg.Height
+	case editedMsg:
+		return m.afterEdit(msg)
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
@@ -136,6 +209,10 @@ func (m model) updateList(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.cursor = max(len(m.files)-1, 0)
 	case "r":
 		m.refresh()
+	case "e":
+		if len(m.files) > 0 {
+			return m, editCmd(m.files[m.cursor].path, false)
+		}
 	case "enter", "l", "right":
 		if len(m.files) == 0 {
 			break
@@ -146,12 +223,7 @@ func (m model) updateList(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.say(path+": "+err.Error(), true)
 			break
 		}
-		m.file, m.focus, m.dirty = f, Ours, false
-		m.lexer = lexers.Match(path)
-		if m.lexer != nil {
-			m.lexer = chroma.Coalesce(m.lexer)
-		}
-		m.jumpTo(0)
+		m.open(f)
 	}
 	return m, nil
 }
@@ -224,6 +296,16 @@ func (m model) updateMerge(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.copy([...]string{"ours", "", "theirs"}[m.focus*2], c.Sides[m.focus])
 	case "Y":
 		m.copy("result", c.Result())
+	case "e":
+		// Keep the choices made so far: write them, with markers for the rest.
+		if m.dirty {
+			if err := m.file.WriteProgress(); err != nil {
+				m.say("Could not write file: "+err.Error(), true)
+				break
+			}
+			m.dirty = false
+		}
+		return m, editCmd(m.file.Path, true)
 	case "s":
 		if err := m.file.Save(); err != nil {
 			m.say("Save failed: "+err.Error(), true)
@@ -244,7 +326,7 @@ func (m *model) copy(what string, lines []string) {
 		m.say("Copy failed: "+err.Error(), true)
 		return
 	}
-	m.say(fmt.Sprintf("Copied %s (%d lines)", what, len(lines)), false)
+	m.say(fmt.Sprintf("📋 Copied %s (%d lines)", what, len(lines)), false)
 }
 
 // jumpTo selects chunk i and scrolls so it is in view with some context.
@@ -325,32 +407,33 @@ func (m model) View() string {
 	return m.viewMerge()
 }
 
+// helpBar takes key, description pairs. Each key gets the next rainbow colour.
 func (m model) helpBar(keys ...string) string {
 	var parts []string
 	for i := 0; i+1 < len(keys); i += 2 {
-		parts = append(parts, keyStyle.Render(keys[i])+" "+faintStyle.Render(keys[i+1]))
+		parts = append(parts, fg(rainbow[i/2%len(rainbow)]).Bold(true).Render(keys[i])+" "+fg(cSub).Render(keys[i+1]))
 	}
-	return lipgloss.NewStyle().MaxWidth(m.w).Render(" " + strings.Join(parts, faintStyle.Render("  ·  ")))
+	return lipgloss.NewStyle().MaxWidth(m.w).Render(" " + strings.Join(parts, fg(cSurface1).Render(" • ")))
 }
 
 func (m model) toast() string {
 	if m.msg == "" {
 		return ""
 	}
-	fg := lipgloss.TerminalColor(doneFg)
 	if m.msgErr {
-		fg = errFg
+		return fg(cRed).Bold(true).Render("✗ " + m.msg)
 	}
-	return lipgloss.NewStyle().Foreground(fg).Render(m.msg)
+	return fg(cGreen).Render(m.msg)
 }
 
 func (m model) viewList() string {
 	var b strings.Builder
-	b.WriteString(badgeStyle.Render("conflux") + faintStyle.Render("  merge conflict resolver") + "\n\n")
-	boxW := max(min(m.w-2, 80), 20)
+	b.WriteString(" " + badge("◆ conflux", cMauve) + fg(cLavender).Render("  merge conflict resolver") + "\n\n")
+	boxW := max(min(m.w-2, 80), 24)
+	inner := boxW - 4
 	var lines []string
 	if len(m.files) == 0 {
-		lines = append(lines, lipgloss.NewStyle().Foreground(doneFg).Render("✓ No conflicted files. All clear!"))
+		lines = append(lines, fg(cGreen).Bold(true).Render("✓ No conflicted files. All clear! 🎉"))
 	}
 	for i, f := range m.files {
 		count := fmt.Sprintf("%d conflict", f.conflicts)
@@ -360,18 +443,20 @@ func (m model) viewList() string {
 		if f.conflicts < 0 {
 			count = "cannot parse"
 		}
-		name := runewidth.Truncate(f.path, boxW-len(count)-8, "…")
-		gap := strings.Repeat(" ", max(boxW-6-runewidth.StringWidth(name)-len(count), 1))
+		name := runewidth.Truncate(f.path, inner-len(count)-5, "…")
+		gap := strings.Repeat(" ", max(inner-3-runewidth.StringWidth(name)-len(count), 1))
 		if i == m.cursor {
-			lines = append(lines, keyStyle.Render("▌ ")+lipgloss.NewStyle().Bold(true).Render(name)+gap+keyStyle.Render(count))
+			bg := lipgloss.NewStyle().Background(cSurface0)
+			lines = append(lines, bg.Foreground(cPeach).Render("▌ ")+bg.Foreground(cText).Bold(true).Render(name)+
+				bg.Render(gap)+bg.Foreground(cPeach).Render(count)+bg.Render(" "))
 		} else {
-			lines = append(lines, "  "+name+gap+faintStyle.Render(count))
+			lines = append(lines, "  "+fg(cText).Render(name)+gap+fg(cOverlay).Render(count)+" ")
 		}
 	}
-	box := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(faint).
+	box := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(cMauve).
 		Padding(0, 1).Width(boxW - 2).Render(strings.Join(lines, "\n"))
 	b.WriteString(box + "\n " + m.toast() + "\n")
-	b.WriteString(m.helpBar("j/k", "move", "enter", "open", "r", "refresh", "q", "quit"))
+	b.WriteString(m.helpBar("j/k", "move", "enter", "open", "e", "edit", "r", "refresh", "q", "quit"))
 	return b.String()
 }
 
@@ -384,17 +469,27 @@ func (m model) viewMerge() string {
 		}
 	}
 
-	// Header: badge, path, progress bar.
-	left := badgeStyle.Render("conflux") + " " + lipgloss.NewStyle().Bold(true).Render(m.file.Path)
+	// Header: badge, path, rainbow progress bar.
+	left := " " + badge("◆ conflux", cMauve) + " " + fg(cLavender).Bold(true).Render(m.file.Path)
 	if m.dirty {
-		left += keyStyle.Render(" ●")
+		left += fg(cPeach).Render(" ● unsaved")
 	}
 	done := len(chunks) - open
-	barW := 12
+	barW := 20
 	filled := done * barW / len(chunks)
-	right := lipgloss.NewStyle().Foreground(doneFg).Render(strings.Repeat("━", filled)) +
-		faintStyle.Render(strings.Repeat("━", barW-filled)) +
-		fmt.Sprintf(" %d/%d resolved ", done, len(chunks))
+	var bar strings.Builder
+	for i := range barW {
+		if i < filled {
+			bar.WriteString(fg(rainbow[i*len(rainbow)/barW]).Render("━"))
+		} else {
+			bar.WriteString(fg(cSurface1).Render("━"))
+		}
+	}
+	progress := fg(cSub).Render(fmt.Sprintf(" %d/%d resolved ", done, len(chunks)))
+	if open == 0 {
+		progress = fg(cGreen).Bold(true).Render(" ✓ all resolved, press s ")
+	}
+	right := bar.String() + progress
 	header := left + strings.Repeat(" ", max(m.w-lipgloss.Width(left)-lipgloss.Width(right), 1)) + right
 
 	// Panes.
@@ -403,103 +498,103 @@ func (m model) viewMerge() string {
 	start := min(m.scroll, max(len(rows)-1, 0))
 	end := min(start+bodyH, len(rows))
 	widths := [3]int{m.w / 3, m.w - 2*(m.w/3), m.w / 3}
-	titles := [3]string{"◀ OURS · " + m.file.Labels[Ours], "RESULT", "THEIRS · " + m.file.Labels[Theirs] + " ▶"}
+	titles := [3]string{"◀ OURS · " + m.file.Labels[Ours], "✦ RESULT ✦", "THEIRS · " + m.file.Labels[Theirs] + " ▶"}
 	var panes [3]string
 	for p := range 3 {
 		inner := max(widths[p]-2, 4)
 		focused := p == m.focus*2
-		ts := lipgloss.NewStyle().Foreground(paneFg[p]).Bold(true)
+		title := runewidth.Truncate(titles[p], inner-2, "…")
+		ts := fg(paneFg[p]).Bold(true).Render(" " + title + " ")
 		if focused {
-			ts = ts.Reverse(true)
+			ts = badge(title, paneFg[p])
 		}
-		lines := []string{lipgloss.PlaceHorizontal(inner, lipgloss.Center, ts.Render(" "+runewidth.Truncate(titles[p], inner-2, "…")+" "))}
+		lines := []string{lipgloss.PlaceHorizontal(inner, lipgloss.Center, ts)}
 		for _, r := range rows[start:end] {
 			lines = append(lines, m.cell(r, p, inner, chunks))
 		}
 		for len(lines) < bodyH+1 {
 			lines = append(lines, strings.Repeat(" ", inner))
 		}
-		border := lipgloss.TerminalColor(faint)
+		border := lipgloss.TerminalColor(cSurface1)
 		if focused {
-			border = accent
+			border = paneFg[p]
 		}
 		panes[p] = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(border).Render(strings.Join(lines, "\n"))
 	}
 
 	// Status line for the current conflict.
 	c := chunks[m.cur]
-	status := keyStyle.Render(fmt.Sprintf(" Conflict %d/%d", m.cur+1, len(chunks))) + "  "
+	status := " " + badge(fmt.Sprintf("Conflict %d/%d", m.cur+1, len(chunks)), cPeach) + "  "
 	if c.AutoMerged() {
-		status += lipgloss.NewStyle().Foreground(doneFg).Render("✨ auto-merged line by line")
+		status += fg(cTeal).Render("✨ auto-merged line by line")
 	} else {
 		for side, name := range []string{"ours", "theirs"} {
-			status += lipgloss.NewStyle().Foreground(paneFg[side*2]).Render(name) + " " + stateBadge(c.States[side]) + "   "
+			status += fg(paneFg[side*2]).Bold(true).Render(name) + " " + stateBadge(c.States[side]) + "   "
 		}
 	}
 	status = strings.TrimRight(status, " ") + "   " + m.toast()
 
 	return header + "\n" + lipgloss.JoinHorizontal(lipgloss.Top, panes[:]...) + "\n" + status + "\n" +
 		m.helpBar("j/k", "change", "h/l", "side", "space", "accept", "x", "decline", "u", "reset",
-			"n", "next open", "m", "auto", "y/Y", "copy side/result", "s", "save", "esc", "back")
+			"n", "next open", "m", "auto", "e", "edit", "y/Y", "copy", "s", "save", "esc", "back")
 }
 
 func stateBadge(s State) string {
 	switch s {
 	case Applied:
-		return lipgloss.NewStyle().Foreground(doneFg).Render("✓ accepted")
+		return fg(cGreen).Render("✓ accepted")
 	case Ignored:
-		return faintStyle.Render("✗ declined")
+		return fg(cRed).Render("✗ declined")
 	}
-	return lipgloss.NewStyle().Foreground(accent).Render("● pending")
+	return fg(cYellow).Render("● pending")
 }
 
 // cell renders pane p of one row: a 2-wide gutter and the text.
 func (m model) cell(r row, p, inner int, chunks []*Chunk) string {
 	w := inner - 2
 	if r.chunk < 0 {
-		return "  " + m.paint(r.cells[p], w, lipgloss.NewStyle().Foreground(textFg), true)
+		return "  " + m.paint(r.cells[p], w, fg(cText), true)
 	}
 	c := chunks[r.chunk]
 	cur := r.chunk == m.cur
-	base := lipgloss.NewStyle().Foreground(textFg).Background(paneBg[p])
-	gutter, highlight := "▎", true
+	base := fg(cText).Background(paneBg[p])
+	gutter, gutterFg, highlight := "▎", lipgloss.TerminalColor(paneFg[p]), true
+	if cur {
+		gutterFg = cPeach
+	}
 	if p == 1 {
 		if c.Done() {
-			base = lipgloss.NewStyle().Foreground(textFg)
+			base = fg(cText)
 		}
 	} else {
 		side := p / 2
 		switch c.States[side] {
 		case Applied:
-			base, highlight = lipgloss.NewStyle().Foreground(doneFg), false
+			base, highlight = fg(cTeal), false
 			if r.first {
-				gutter = "✓"
+				gutter, gutterFg = "✓", cGreen
 			}
 		case Ignored:
-			base, highlight = lipgloss.NewStyle().Foreground(faint).Strikethrough(true), false
+			base, highlight = fg(cOverlay).Strikethrough(true), false
 			if r.first {
-				gutter = "✗"
+				gutter, gutterFg = "✗", cRed
 			}
 		default:
 			if r.first {
-				gutter = "●"
+				gutter, gutterFg = "●", cYellow
 			}
 		}
 		if cur && side == m.focus {
 			base = base.Background(paneBgHi[p]).Bold(true)
 			if r.first {
-				gutter = "▶"
+				gutter, gutterFg = "▶", cPeach
 			}
 		}
-	}
-	gfg := lipgloss.TerminalColor(paneFg[p])
-	if cur {
-		gfg = accent
 	}
 	text := r.cells[p]
 	if r.first && r.empty[p] {
 		text, highlight = "(no lines)", false
-		base = base.Foreground(faint).Italic(true)
+		base = base.Foreground(cOverlay).Italic(true)
 	}
-	return lipgloss.NewStyle().Foreground(gfg).Render(gutter+" ") + m.paint(text, w, base, highlight)
+	return fg(gutterFg).Render(gutter+" ") + m.paint(text, w, base, highlight)
 }

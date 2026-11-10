@@ -64,6 +64,21 @@ func TestToggle(t *testing.T) {
 	}
 }
 
+// Partly resolved files keep open conflicts as markers, with base and labels.
+func TestRenderWithMarkers(t *testing.T) {
+	in := "a\n<<<<<<< main\no1\n||||||| base\nb1\n=======\nt1\n>>>>>>> feat\nm\n<<<<<<< main\no2\n=======\nt2\n>>>>>>> feat\n"
+	segs, nl, err := Parse(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &File{Segs: segs, TrailingNewline: nl, Labels: [2]string{"main", "feat"}}
+	f.Chunks()[1].Toggle(Theirs)
+	want := "a\n<<<<<<< main\no1\n||||||| base\nb1\n=======\nt1\n>>>>>>> feat\nm\nt2\n"
+	if got := f.render(true); got != want {
+		t.Fatalf("got %q", got)
+	}
+}
+
 func TestParseErrors(t *testing.T) {
 	for _, in := range []string{"<<<<<<< a\nx\n", "<<<<<<< a\nx\n<<<<<<< b\n"} {
 		if _, _, err := Parse(in); err == nil {

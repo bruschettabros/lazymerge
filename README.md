@@ -42,6 +42,7 @@ make install PREFIX=$HOME/.local   # or to ~/.local/bin
 |-----|--------|
 | `j` `k` / `↓` `↑`, `g` `G` | Move, go to first / last |
 | `enter` / `l` | Open the file |
+| `e` | Edit the file in your editor |
 | `r` | Refresh the list |
 | `q` / `esc` | Quit |
 
@@ -62,21 +63,39 @@ side). Then press `space` to accept it.
 | `ctrl+d` `ctrl+u`, `ctrl+e` `ctrl+y` | Scroll half a page / one line |
 | `m` | Auto-resolve all simple conflicts |
 | `y` / `Y` | Copy the selected change / the current result as plain text |
+| `e` | Edit the file in your editor (see below) |
 | `s` | Save and stage (only when all conflicts are resolved) |
 | `esc` / `q` | Back to the file list (press twice to discard unsaved changes) |
 
 To take **both** changes: accept one side with `space`, move to the other side, and press
 `space` again. The result has them in the order you accepted them.
 
+### Edit in your editor
+
+Press `e` to open the file in your editor. conflux uses the same editor as git:
+`GIT_EDITOR`, then `core.editor`, then `$VISUAL`, then `$EDITOR`, then `vi`.
+
+- In the merge view, conflux first writes the choices you made. Conflicts that are still
+  open stay in the file as normal git conflict markers, with the base text when it is known.
+  It does not stage the file.
+- When you close the editor and conflicts remain, conflux opens the merge view again.
+- When no conflict markers remain, conflux runs `git add` on the file.
+
+GUI editors must wait until you close the file, for example
+`git config --global core.editor "code --wait"`.
+
 ### Display
 
-- Pending changes have a blue (ours), green (theirs) or purple (result) background.
-- The selected change has a brighter background and a `▶` marker. The selected side has an
-  orange border.
-- `✓` is an accepted change and `✗` (struck through) is a declined change.
-- The header shows a progress bar of resolved conflicts. `●` means you have unsaved changes.
-- Code has syntax highlighting, chosen from the file name ([chroma](https://github.com/alecthomas/chroma)).
-  The theme is `monokai` on dark terminals and `github` on light terminals.
+conflux uses the [Catppuccin](https://catppuccin.com) colours: Mocha on dark terminals and
+Latte on light terminals. Syntax highlighting uses the matching Catppuccin theme
+([chroma](https://github.com/alecthomas/chroma)), chosen from the file name.
+
+- Ours is blue, the result is mauve and theirs is green. Pending changes have a tinted background.
+- The selected change has a brighter background and a peach `▶`. The selected side has a
+  border in its own colour.
+- `●` (yellow) is pending, `✓` (green) is accepted and `✗` (red, struck through) is declined.
+- The header shows a rainbow progress bar of resolved conflicts and `● unsaved` when you
+  have unsaved changes.
 
 ## Auto-resolve
 
@@ -103,8 +122,7 @@ into the file directly.
 
 - Text files with conflict markers only. Binary files and delete/modify conflicts are not
   supported. Resolve those with `git checkout --ours/--theirs` or `git rm`.
-- No in-place text editing of the result. Copy a side with `c`/`C`, then edit the saved
-  file in your editor if you need a mix.
+- No text editing inside conflux. Press `e` to finish a file in your editor.
 - Each line is highlighted on its own, so multi-line strings and comments can have the
   wrong colour.
 - Copy uses the system clipboard (`pbcopy` on macOS, `xclip`/`xsel`/`wl-copy` on Linux).
