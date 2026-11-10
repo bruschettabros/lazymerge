@@ -173,3 +173,18 @@ into the file directly.
 | `make clean` | Remove the built binary |
 
 The tests include an end-to-end test that makes a real git merge conflict in a temp folder.
+
+### Code layout
+
+All code is in one `main` package, with one file for each job:
+
+| File | Contents |
+|------|----------|
+| `main.go` | Entry point: finds the repo root and starts the UI |
+| `conflict.go` | Conflict model: parse markers, pick/decline/undo state, auto-resolve, render the file |
+| `git.go` | git calls: list conflicted files, load (with the base from the index), save and stage |
+| `model.go` | UI state and actions: files, selection, undo stack, layout sizes |
+| `keys.go` | Keyboard and mouse input |
+| `view.go` | Drawing: panels, merge panes, popups, bottom bar |
+| `editor.go` | Open the file in the user's editor and reload it after |
+| `theme.go` | Catppuccin colours |

@@ -51,10 +51,10 @@ func TestToggle(t *testing.T) {
 		done   bool
 		choice string
 	}{
-		{func() { c.Toggle(Ours) }, []string{"o"}, true, "ours"},        // accept ours, decline theirs
-		{func() { c.Toggle(Theirs) }, []string{"o", "t"}, true, "both"}, // add theirs: both
-		{func() { c.Toggle(Ours) }, []string{"t"}, true, "theirs"},      // un-accept ours
-		{func() { c.Decline(Theirs) }, []string{"b"}, true, "base"},     // decline both: base
+		{func() { c.Toggle(Ours) }, []string{"o"}, true, "ours"},
+		{func() { c.Toggle(Theirs) }, []string{"o", "t"}, true, "both"},
+		{func() { c.Toggle(Ours) }, []string{"t"}, true, "theirs"},
+		{func() { c.Decline(Theirs) }, []string{"b"}, true, "base"},
 		{func() { c.Reset() }, []string{"b"}, false, "pending"},
 	}
 	for i, st := range steps {
@@ -65,7 +65,6 @@ func TestToggle(t *testing.T) {
 	}
 }
 
-// Partly resolved files keep open conflicts as markers, with base and labels.
 func TestRenderWithMarkers(t *testing.T) {
 	in := "a\n<<<<<<< main\no1\n||||||| base\nb1\n=======\nt1\n>>>>>>> feat\nm\n<<<<<<< main\no2\n=======\nt2\n>>>>>>> feat\n"
 	segs, nl, err := Parse(in)
@@ -113,11 +112,9 @@ func run(t *testing.T, args ...string) {
 	t.Helper()
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t")
-	cmd.Run() // merge exits 1 on conflict, that is expected
+	cmd.Run()
 }
 
-// End to end: a real merge conflict in 2-way style gets its base from the
-// index, auto-resolves, saves and is staged.
 func TestLoadAutoResolveSave(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
@@ -143,7 +140,7 @@ func TestLoadAutoResolveSave(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 2-way style joins both conflicts into one; diff3 from the index splits them.
+
 	if n := len(f.Chunks()); n != 2 {
 		t.Fatalf("want 2 chunks from the index, got %d", n)
 	}
